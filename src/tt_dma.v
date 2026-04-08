@@ -1,138 +1,347 @@
 /*
- * Copyright (c) 2024 Your Name
+ * Copyright (c) 2026 Zisis Katsaros
  * SPDX-License-Identifier: Apache-2.0
  */
+
 `default_nettype none
 
-// -----------------------------------------------------------------------------
-// Tiny DMA with TinyTapeout wrapper (combined file)
-// ----------------------------------------------------------------------------- 
-module tt_um_dma (
-    input  wire [7:0] ui_in,    // dedicated inputs -> used as cfg_in
-    output wire [7:0] uo_out,   // dedicated outputs
-    input  wire [7:0] uio_in,   // IOs: input path (unused here)
-    output wire [7:0] uio_out,  // IOs: output path (unused here)
-    output wire [7:0] uio_oe,   // IOs: enable path (unused here)
-    input  wire       ena,      // always 1 when powered
+module tt_um_auth_dmac (
+    input  wire [7:0] ui_in,    // Dedicated inputs
+    output wire [7:0] uo_out,   // Dedicated outputs
+    input  wire [7:0] uio_in,   // IOs: Input path
+    output wire [7:0] uio_out,  // IOs: Output path
+    output wire [7:0] uio_oe,   // IOs: Enable path (active high: 0=input, 1=output)
+    input  wire       ena,      // always 1 when the design is powered, so you can ignore it
     input  wire       clk,      // clock
-    input  wire       rst_n     // active-low reset
+    input  wire       rst_n     // reset_n - low to reset
 );
 
-    // Map dedicated input bus to cfg_in for the DMA
-    wire [7:0] cfg_in  = ui_in;     // <-- added as you requested
+    // Timeout limit
+    localparam timeout_limit = 12; // If no rtrn_rise pulse is detected within the timeout_limit in states: RECEIVE, SENDaddr, SENDdata
+                                            // then timeout and return to IDLE state with BR and done low
+    localparam timeout_cntr_width = $clog2(timeout_limit+1);
 
-    // Outputs from the DMA core
-    wire [6:0] data_out;
-    wire       dma_done;
+    // Inputs
+    wire       start;
+    wire       BG;
+    wire       rtrn;
+    wire [4:0] cfg_in;
 
-    // Instantiate DMA core
-    tiny_dma dma_core (
-        .clk(clk),
-        .rst(rst_n),      // active-low reset (your core uses negedge rst)
-        .cfg_in(cfg_in),
-        .data_out(data_out),
-        .dma_done(dma_done)
-    );
+    // Internal output controls
+    reg BR;
+    reg WRITE_en;
+    reg done;
+    reg valid;
+    reg ack;
+    reg target; // 0: mem, 1: io
+    reg transfer_drive;
+    reg [7:0] transfer_bus_out;
 
-    // Pack outputs for TinyTapeout: bit7 = dma_done, bits[6:0] = data_out
-    assign uo_out = {dma_done, data_out};
+    // Config and data registers
+    reg mode;           // 0: single word, 1: 4-word burst
+    reg direction;      // 0: mem -> io, 1: io -> mem
+    reg [7:0] src_addr;
+    reg [7:0] dst_addr;
+    reg [7:0] data_buffer;
 
-    // Not using bidirectional IOs in this design -> tie off
-    assign uio_out = 8'b0;
-    assign uio_oe  = 8'b0;
+    // Counters
+    reg [1:0] prep_cntr;
+    reg [1:0] src_send_cntr;
+    reg dst_addr_cntr;
+    reg dst_data_cntr;
+    reg [1:0] words_left;
+    reg [timeout_cntr_width-1:0] timeout_cntr; 
+    
+    // 2FF synchronizers for CDC 
+    reg rtrn_ff1, rtrn_ff2, rtrn_ff2_d;
+    wire rtrn_sync;
+    wire rtrn_rise;
 
-    // Avoid unused warnings (reduction AND of concatenation)
-    wire _unused = &{ena, uio_in, 1'b0};
+    // timeout signals
+    wire wait_for_rtrn;
+    wire timeout;                                        
 
-endmodule
+    // Input Mapping
+    assign start = ui_in[7];
+    assign BG = ui_in[6];
+    assign rtrn = ui_in[5];
+    assign cfg_in = ui_in[4:0];
 
+    // Output Mapping
+    assign uo_out[7] = BR;
+    assign uo_out[6] = WRITE_en;
+    assign uo_out[5] = done;
+    assign uo_out[4] = valid;
+    assign uo_out[3] = ack;
+    assign uo_out[2] = target;
+    assign uo_out[1:0] = 2'b00;
 
-// -----------------------------------------------------------------------------
-// DMA Core
-// -----------------------------------------------------------------------------
-module tiny_dma (
-    input  wire       clk,
-    input  wire       rst,       // active-low reset (neg edge in always)
-    input  wire [7:0] cfg_in,    // [7]=start, [6:4]=src, [3:1]=dst, [0]=count_mode
-    output reg  [6:0] data_out,  // last written 7-bit data
-    output reg        dma_done   // 1-cycle done pulse
-);
+    // BIDIR Mapping
+    assign uio_out = transfer_bus_out;
+    assign uio_oe = {8{transfer_drive}};
 
-    // 8 words x 7 bits memory
-    reg [6:0] mem [0:7];
+    // rtrn synchronizer and pulse generator
+    assign rtrn_sync = rtrn_ff2;
+    assign rtrn_rise = rtrn_sync & ~rtrn_ff2_d;
+    // assign rtrn_rise = rtrn_ff1 & ~rtrn_ff2; 
 
-    // internal regs
-    reg [2:0] src_ptr;
-    reg [2:0] dst_ptr;
-    reg [2:0] words_left;
-    reg [1:0] state;
+    // timeout logic
+    assign wait_for_rtrn = (current_state == RECEIVE) || (current_state == SENDaddr) || (current_state == SENDdata);
+    assign timeout = wait_for_rtrn && !rtrn_rise && (timeout_cntr == timeout_limit-1);
 
-    // states
-    localparam IDLE     = 2'b00;
-    localparam TRANSFER = 2'b01;
-    localparam DONE     = 2'b10;
+    // FSM 
+    reg [2:0] current_state;
+    reg [2:0] next_state;
 
-    // preload demo data on reset (7-bit ASCII a–d)
-    // NOTE: reset is active-low: always @(posedge clk or negedge rst)
-    always @(posedge clk or negedge rst) begin
-        if (!rst) begin
-            state      <= IDLE;
-            data_out   <= 7'h00;
-            dma_done   <= 1'b0;
-            words_left <= 3'd0;
-            src_ptr    <= 3'd0;
-            dst_ptr    <= 3'd0;
-            mem[0]     <= 7'h61; // "a"
-            mem[1]     <= 7'h62; // "b"
-            mem[2]     <= 7'h63; // "c"
-            mem[3]     <= 7'h64; // "d"
-            mem[4]     <= 7'h00;
-            mem[5]     <= 7'h00;
-            mem[6]     <= 7'h00;
-            mem[7]     <= 7'h00;
-        end else begin
-                // default drivers (avoids undriven warnings)
-          dma_done <= 1'b0;
-          data_out <= data_out; // hold last value unless updated
-            case (state)
+    localparam [2:0] IDLE       = 3'b000;
+    localparam [2:0] PREPARATION = 3'b001;
+    localparam [2:0] WAIT4BG    = 3'b010;
+    localparam [2:0] SRC_SEND   = 3'b011;
+    localparam [2:0] RECEIVE    = 3'b100;
+    localparam [2:0] SENDaddr   = 3'b101;
+    localparam [2:0] SENDdata   = 3'b110;
+
+    always @(posedge clk or negedge rst_n) begin: SEQUENTIAL_LOGIC
+        if (!rst_n) begin
+            // reset sync FFs
+            rtrn_ff1 <= 1'b0;
+            rtrn_ff2 <= 1'b0;
+            rtrn_ff2_d <= 1'b0;
+
+            // reset counters
+            prep_cntr <= 2'b00;
+            src_send_cntr <= 2'b0;
+            dst_addr_cntr <= 1'b0;
+            dst_data_cntr <= 1'b0;
+            timeout_cntr <= {timeout_cntr_width{1'b0}};
+
+            // reset internal regs
+            mode <= 1'b0;
+            direction <= 1'b0;
+            src_addr <= 8'h00;
+            dst_addr <= 8'h00;
+            data_buffer <= 8'h00;
+            words_left <= 2'b00;
+            done <= 1'b0;
+            ack <= 1'b0;
+
+            // reset FSM state
+            current_state <= IDLE;
+        end 
+        else begin
+            // Update sync FFs
+            rtrn_ff1 <= rtrn;
+            rtrn_ff2 <= rtrn_ff1;
+            rtrn_ff2_d <= rtrn_ff2;
+
+            // Update FSM state
+            current_state <= next_state;
+
+            // Pulse ack when the DMAC samples a return signal
+            ack <= rtrn_rise;
+
+            // State-specific sequential logic
+            case (current_state)
                 IDLE: begin
-                    dma_done <= 1'b0;
-                    if (cfg_in[7]) begin
-                        src_ptr    <= cfg_in[6:4];
-                        dst_ptr    <= cfg_in[3:1];
-                        words_left <= (cfg_in[0]) ? 3 : 1; // burst=3, single=1
-                        state      <= TRANSFER;
+                    // reset counters
+                    prep_cntr <= 2'b00; 
+                    src_send_cntr <= 2'b0;
+                    dst_addr_cntr <= 1'b0;
+                    dst_data_cntr <= 1'b0;
+                    timeout_cntr <= {timeout_cntr_width{1'b0}};
+                end
+                PREPARATION: begin
+                    case (prep_cntr) // preparation sequence
+                        2'b00: begin
+                            src_addr[3:0] <= cfg_in[3:0];
+                            mode <= cfg_in[4];
+                        end
+                        2'b01: begin
+                            src_addr[7:4] <= cfg_in[3:0];
+                            direction <= cfg_in[4];
+                        end
+                        2'b10: begin
+                            dst_addr[3:0] <= cfg_in[3:0];
+                        end
+                        2'b11: begin
+                            dst_addr[7:4] <= cfg_in[3:0];
+                            words_left <= mode ? 2'b11 : 2'b00;
+                        end
+                        default: begin
+                        end
+                    endcase
+
+                    // update prep counter
+                    if (prep_cntr != 2'b11) prep_cntr <= prep_cntr + 2'b01;
+                end
+                WAIT4BG: begin
+                    src_send_cntr <= 2'b0;
+                    dst_addr_cntr <= 1'b0;
+                    dst_data_cntr <= 1'b0;
+                    timeout_cntr <= {timeout_cntr_width{1'b0}};
+                end
+                SRC_SEND: begin
+                    dst_addr_cntr <= 1'b0;
+                    dst_data_cntr <= 1'b0;
+                    timeout_cntr <= {timeout_cntr_width{1'b0}};
+
+                    // update src_addr send counter
+                    if (src_send_cntr != 2'b10) src_send_cntr <= src_send_cntr + 1'b1;
+                end
+                RECEIVE: begin
+                    src_send_cntr <= 2'b0;
+                    dst_addr_cntr <= 1'b0;
+                    dst_data_cntr <= 1'b0;
+
+                    if (rtrn_rise) timeout_cntr <= {timeout_cntr_width{1'b0}};
+                    else if (timeout_cntr != timeout_limit) timeout_cntr <= timeout_cntr + 1;
+
+                    // capture data from transfer_bus
+                    if (rtrn_rise) data_buffer <= uio_in; 
+                end
+                SENDaddr: begin
+                    src_send_cntr <= 2'b0;
+                    dst_data_cntr <= 1'b0;
+
+                    if (rtrn_rise) timeout_cntr <= {timeout_cntr_width{1'b0}};
+                    else if (timeout_cntr != timeout_limit) timeout_cntr <= timeout_cntr + 1;
+
+                    // update dest_addr send counter
+                    if (dst_addr_cntr == 1'b0) dst_addr_cntr <= 1'b1;
+                    else if (rtrn_rise) dst_addr_cntr <= 1'b0;
+                end
+                SENDdata: begin
+                    src_send_cntr <= 2'b0;
+                    dst_addr_cntr <= 1'b0;
+
+                    if (rtrn_rise) timeout_cntr <= {timeout_cntr_width{1'b0}};
+                    else if (timeout_cntr != timeout_limit) timeout_cntr <= timeout_cntr + 1;
+
+                    // update dest_data send counter
+                    if (dst_data_cntr == 1'b0) dst_data_cntr <= 1'b1;
+                    else if (rtrn_rise) begin
+                        dst_data_cntr <= 1'b0;
+                        if (words_left == 2'b0) done <= 1'b1; // send done if no more words left
+                        else begin
+                            words_left <= words_left - 2'b01; // decrement words left, increment addresses
+                            src_addr <= src_addr + 8'h01;
+                            dst_addr <= dst_addr + 8'h01;
+                        end
                     end
                 end
-
-                TRANSFER: begin
-                    // perform transfer: read mem[src_ptr] and write to mem[dst_ptr]
-                    mem[dst_ptr] <= mem[src_ptr];  // write (register/memory update)
-                    data_out     <= mem[src_ptr];  // reflect the value being written
-
-                    src_ptr      <= src_ptr + 1;
-                    dst_ptr      <= dst_ptr + 1;
-
-                    if (words_left == 1) begin
-                        // last word just handled, move to DONE next cycle
-                        words_left <= 0;
-                        state      <= DONE;
-                        // keep dma_done low here; it will be asserted in DONE state
-                        dma_done   <= 1'b0;
-                    end else begin
-                        words_left <= words_left - 1;
-                    end
+                default: begin
+                    src_send_cntr <= 2'b0;
+                    dst_addr_cntr <= 1'b0;
+                    dst_data_cntr <= 1'b0;
+                    timeout_cntr <= {timeout_cntr_width{1'b0}};
                 end
-
-                DONE: begin
-                    // One-cycle pulse indicating DMA completed
-                    dma_done <= 1'b1;
-                    state    <= IDLE;
-                end
-
-                default: state <= IDLE;
             endcase
         end
     end
+
+    always @(*) begin: NEXT_STATE_LOGIC
+        next_state = current_state;
+
+        case (current_state)
+            IDLE: begin
+              if (start) next_state = PREPARATION;
+            end
+            PREPARATION: begin
+                if (prep_cntr == 2'b11) next_state = WAIT4BG;
+            end
+            WAIT4BG: begin
+                if (BG) next_state = SRC_SEND;
+            end
+            SRC_SEND: begin
+                if(src_send_cntr == 2'b10) next_state = RECEIVE;
+            end
+            RECEIVE: begin
+                if (rtrn_rise) next_state = SENDaddr;
+                else if (timeout) next_state = IDLE;
+            end
+            SENDaddr: begin
+                if ((dst_addr_cntr == 1'b1) && rtrn_rise) begin
+                    next_state = SENDdata;
+                end
+                else if (timeout) begin
+                    next_state = IDLE;
+                end
+            end
+            SENDdata: begin
+                if ((dst_data_cntr == 1'b1) && rtrn_rise) begin
+                    if (words_left == 2'b00) next_state = IDLE; // move to idle if no more words left
+                    else next_state = SRC_SEND; // else go back to src_send
+                end
+                else if (timeout) begin
+                    next_state = IDLE;
+                end
+            end
+            default: begin
+                next_state = IDLE;
+            end
+        endcase
+    end
+  
+    always @(*) begin: OUTPUT_LOGIC
+        BR = 1'b0;
+        WRITE_en = 1'b0;
+        valid = 1'b0;
+        target = 1'b0;
+        transfer_drive = 1'b0;
+        transfer_bus_out = 8'h00;
+
+        case (current_state)
+            IDLE: begin
+            end
+            PREPARATION: begin
+            end
+            WAIT4BG: begin
+                BR = 1'b1; // send BR to CPU
+            end
+            SRC_SEND: begin
+                BR = 1'b1;
+                WRITE_en = 1'b0;
+                // direction=0: send to mem, direction=1: send to io
+                target = direction;
+                transfer_drive = 1'b1; // set bidir to output
+                transfer_bus_out = src_addr;
+
+                // after one cycle send valid
+                if(src_send_cntr != 2'b0) valid = 1'b1; 
+            end
+            RECEIVE: begin
+                BR = 1'b1;
+                WRITE_en = 1'b0;
+                transfer_drive = 1'b0; // set bidir to input
+            end
+            SENDaddr: begin
+                BR = 1'b1;
+                WRITE_en = 1'b1;
+                // direction=0: send to io, direction=1: send to mem
+                target = ~direction;
+                transfer_drive = 1'b1; // set bidir to output
+                transfer_bus_out = dst_addr;
+
+                // after one cycle send valid
+                if (dst_addr_cntr == 1'b1) valid = 1'b1;
+            end
+            SENDdata: begin
+                BR = 1'b1;
+                WRITE_en = 1'b1; 
+                // direction=0: send to io, direction=1: send to mem
+                target = ~direction;
+                transfer_drive = 1'b1; // set bidir to output
+                transfer_bus_out = data_buffer;
+
+                // after one cycle send valid
+                if (dst_data_cntr == 1'b1) valid = 1'b1;
+            end
+            default: begin
+            end
+        endcase
+    end
+
+    // Prevent unused warning for currently unconsumed mode bits.
+    wire _unused_ok = &{ena, direction, 1'b0};
 
 endmodule
